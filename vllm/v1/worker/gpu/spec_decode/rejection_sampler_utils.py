@@ -120,9 +120,10 @@ def _compute_global_target_argmax(
     # See _insert_resampled_kernel: NaN breaks tl.argmax index bounds.
     local_max = tl.where(local_max != local_max, float("-inf"), local_max)
     max_block_idx = tl.argmax(local_max, axis=0)
-    return tl.load(
+    target_argmax = tl.load(
         target_local_argmax_ptr + logit_idx * target_local_argmax_stride + max_block_idx
     ).to(tl.int64)
+    return target_argmax, tl.max(local_max, axis=0)
 
 
 @triton.jit
@@ -573,11 +574,15 @@ def _rejection_kernel(
     fly_entropy_ptr,
     fly_entropy_threshold,
     vocab_num_blocks,
+    cot_margin,
+    req_in_cot_ptr,
+    req_last_pos_ptr,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
     SYNTHETIC_MODE: tl.constexpr,
     USE_BLOCK_VERIFICATION: tl.constexpr,
     FLY_WINDOW_SIZE: tl.constexpr,
+    COT_LENIENT: tl.constexpr = False,
 ):
     req_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
@@ -587,6 +592,31 @@ def _rejection_kernel(
     seed = tl.load(seed_ptr + req_state_idx)
     temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
     is_greedy = temp == 0.0
+
+    # Gemma 4 thinking-block control token IDs:
+    # 100 = `<|channel>` (enters CoT thinking span)
+    # 101 = `<channel|>` (exits CoT thinking span)
+    # 107 = first non-control vocabulary token ID
+    COT_START_TOKEN_ID: tl.constexpr = 100
+    COT_END_TOKEN_ID: tl.constexpr = 101
+    MIN_NORMAL_TOKEN_ID: tl.constexpr = 107
+
+    in_cot = 1
+    first_pos = tl.zeros((), tl.int64)
+    if COT_LENIENT:
+        first_pos = tl.load(pos_ptr + start_idx).to(tl.int64)
+        last_pos = tl.load(req_last_pos_ptr + req_state_idx)
+        # If `first_pos != last_pos`, a new request just started on this slot.
+        in_cot = tl.where(
+            first_pos == last_pos,
+            tl.load(req_in_cot_ptr + req_state_idx),
+            1,
+        )
+        prev_tok = tl.load(draft_sampled_ptr + start_idx).to(tl.int64)
+        if prev_tok == COT_START_TOKEN_ID:
+            in_cot = 1
+        elif prev_tok == COT_END_TOKEN_ID:
+            in_cot = 0
 
     accepted_length = tl.zeros((), tl.int64)
     # Freeze the accepted prefix and recovery stats until the window is confirmed.
@@ -618,7 +648,7 @@ def _rejection_kernel(
                 # Greedy sampling. Accept IFF draft matches target argmax.
                 # NOTE: Target argmax is stored directly so that resampling
                 # can be skipped upon rejection.
-                target_argmax = _compute_global_target_argmax(
+                target_argmax, target_max_logit = _compute_global_target_argmax(
                     target_local_max_ptr,
                     target_local_max_stride,
                     target_local_argmax_ptr,
@@ -632,6 +662,24 @@ def _rejection_kernel(
                     accepted = u < rate
                 else:
                     accepted = target_argmax == draft_sampled
+                    if COT_LENIENT:
+                        if (draft_sampled == COT_END_TOKEN_ID) | (
+                            target_argmax == COT_END_TOKEN_ID
+                        ):
+                            in_cot = 0
+                        if (
+                            (in_cot != 0)
+                            & (draft_sampled >= MIN_NORMAL_TOKEN_ID)
+                            & (target_argmax >= MIN_NORMAL_TOKEN_ID)
+                        ):
+                            draft_logit = tl.load(
+                                target_logits_ptr
+                                + logit_idx * target_logits_stride
+                                + draft_sampled
+                            ).to(tl.float32)
+                            accepted = accepted | (
+                                (target_max_logit - draft_logit) <= cot_margin
+                            )
                 accepted &= is_valid_draft
                 if FLY_WINDOW_SIZE > 0:
                     target_logit = tl.load(
@@ -746,9 +794,17 @@ def _rejection_kernel(
                 else:
                     verifying = accepted
                     accepted_length += accepted
+                    emitted_tok = (
+                        target_argmax if is_greedy and not accepted else draft_sampled
+                    )
+                    if COT_LENIENT:
+                        if emitted_tok == COT_START_TOKEN_ID:
+                            in_cot = 1
+                        elif emitted_tok == COT_END_TOKEN_ID:
+                            in_cot = 0
                     tl.store(
                         sampled_ptr + req_idx * sampled_stride + i,
-                        target_argmax if is_greedy and not accepted else draft_sampled,
+                        emitted_tok,
                     )
     if FLY_WINDOW_SIZE > 0 and is_greedy and accepted_length < num_draft_tokens:
         tl.store(
@@ -756,6 +812,23 @@ def _rejection_kernel(
             rejected_argmax,
         )
 
+    if COT_LENIENT:
+        if verifying and is_greedy:
+            bonus_argmax, _ = _compute_global_target_argmax(
+                target_local_max_ptr,
+                target_local_max_stride,
+                target_local_argmax_ptr,
+                target_local_argmax_stride,
+                start_idx + num_draft_tokens,
+                vocab_num_blocks,
+                PADDED_VOCAB_NUM_BLOCKS,
+            )
+            if bonus_argmax == COT_START_TOKEN_ID:
+                in_cot = 1
+            elif bonus_argmax == COT_END_TOKEN_ID:
+                in_cot = 0
+        tl.store(req_in_cot_ptr + req_state_idx, in_cot)
+        tl.store(req_last_pos_ptr + req_state_idx, first_pos + accepted_length + 1)
     tl.store(rejected_steps_ptr + req_idx, accepted_length)
     if USE_BLOCK_VERIFICATION and not is_greedy and accepted_length < num_draft_tokens:
         # Compute the target and draft log exponential sums for the
@@ -782,6 +855,35 @@ def _rejection_kernel(
             )
     tl.store(target_rejected_logsumexp_ptr + req_idx, target_lse)
     tl.store(draft_rejected_logsumexp_ptr + req_idx, draft_lse)
+
+
+_V2_COT_LENIENCE_MARGIN: float = 0.0
+_V2_REQ_IN_COT_BUFFERS: dict[torch.device, torch.Tensor] = {}
+_V2_REQ_LAST_POS_BUFFERS: dict[torch.device, torch.Tensor] = {}
+
+
+def _get_v2_cot_state_buffers(
+    device: torch.device,
+    min_size: int = 4096,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cap = max(4096, min_size)
+    in_cot_buf = _V2_REQ_IN_COT_BUFFERS.get(device)
+    last_pos_buf = _V2_REQ_LAST_POS_BUFFERS.get(device)
+    if in_cot_buf is None or in_cot_buf.numel() < cap or last_pos_buf is None:
+        in_cot_buf = torch.ones((cap,), dtype=torch.int32, device=device)
+        last_pos_buf = torch.full((cap,), -1, dtype=torch.int64, device=device)
+        _V2_REQ_IN_COT_BUFFERS[device] = in_cot_buf
+        _V2_REQ_LAST_POS_BUFFERS[device] = last_pos_buf
+    return in_cot_buf, last_pos_buf
+
+
+def set_v2_cot_lenience(margin: float) -> None:
+    global _V2_COT_LENIENCE_MARGIN
+    _V2_COT_LENIENCE_MARGIN = float(margin)
+    for buf in _V2_REQ_IN_COT_BUFFERS.values():
+        buf.fill_(1)
+    for buf in _V2_REQ_LAST_POS_BUFFERS.values():
+        buf.fill_(-1)
 
 
 @triton.jit
@@ -1351,6 +1453,14 @@ def rejection_sample(
     num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
     target_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)
     draft_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)
+    cot_lenient = _V2_COT_LENIENCE_MARGIN > 0.0
+    if cot_lenient:
+        req_in_cot_buf, req_last_pos_buf = _get_v2_cot_state_buffers(
+            target_logits.device, temperature.shape[0]
+        )
+    else:
+        req_in_cot_buf = None
+        req_last_pos_buf = None
     _rejection_kernel[(num_reqs,)](
         sampled,
         sampled.stride(0),
@@ -1386,11 +1496,15 @@ def rejection_sample(
         fly_entropy,
         fly_entropy_threshold,
         vocab_num_blocks,
+        float(_V2_COT_LENIENCE_MARGIN),
+        req_in_cot_buf,
+        req_last_pos_buf,
         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
         HAS_DRAFT_LOGITS=has_draft_logits,
         SYNTHETIC_MODE=synthetic_conditional_rates is not None,
         USE_BLOCK_VERIFICATION=use_block_verification,
         FLY_WINDOW_SIZE=fly_window_size,
+        COT_LENIENT=cot_lenient,
         num_warps=1,
     )
 

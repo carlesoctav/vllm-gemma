@@ -237,8 +237,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         attn_metadata = None
         slot_mappings_by_layer = None
-        for step in range(1, num_speculative_steps):
-            if not skip_attn and (self.advance_draft_positions or step == 1):
+        first_step = 1 if self.advance_draft_positions else 0
+        for step in range(first_step, num_speculative_steps):
+            if not skip_attn and (self.advance_draft_positions or step == first_step):
                 slot_mappings = self.block_tables.compute_slot_mappings(
                     idx_mapping,
                     query_start_loc,
@@ -288,6 +289,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         attn_metadata = None
         slot_mappings_by_layer = None
+        first_step = 1 if self.advance_draft_positions else 0
         if not skip_attn:
             slot_mappings = self.block_tables.compute_slot_mappings(
                 self.idx_mapping[:num_reqs],
@@ -303,7 +305,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 num_reqs=num_reqs,
                 num_query_per_req=1,
                 seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-                step=1,
+                step=first_step,
             )
 
         self._fused_multi_step_decode(
@@ -330,9 +332,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         positions = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
 
-        for step in range(1, num_speculative_steps):
+        first_step = 1 if self.advance_draft_positions else 0
+        for step in range(first_step, num_speculative_steps):
             if attn_metadata is not None and (
-                self.advance_draft_positions or step == 1
+                self.advance_draft_positions or step == first_step
             ):
                 self.block_tables.compute_slot_mappings(
                     idx_mapping,
