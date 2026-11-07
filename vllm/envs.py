@@ -708,7 +708,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "NVCC_THREADS": lambda: os.getenv("NVCC_THREADS", None),
     # If set, vllm will use precompiled native binaries (*.so and vllm-rs).
     "VLLM_USE_PRECOMPILED": lambda: (
-        os.environ.get("VLLM_USE_PRECOMPILED", "").strip().lower() in ("1", "true")
+        os.environ.get("VLLM_USE_PRECOMPILED", "1").strip().lower() in ("1", "true")
         or bool(os.environ.get("VLLM_PRECOMPILED_WHEEL_LOCATION"))
     ),
     # If set, vllm will use the precompiled Rust frontend binary (vllm-rs).

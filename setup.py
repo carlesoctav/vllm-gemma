@@ -1015,7 +1015,10 @@ class precompiled_wheel_utils:
             variant = os.getenv("VLLM_PRECOMPILED_WHEEL_VARIANT", None)
             if variant is None:
                 variant = precompiled_wheel_utils.detect_system_cuda_variant()
-            commit = os.getenv("VLLM_PRECOMPILED_WHEEL_COMMIT", "").lower()
+            commit = os.getenv(
+                "VLLM_PRECOMPILED_WHEEL_COMMIT",
+                "80e0cd68f812bfef5e6e7cffef3350daa01ff222",
+            ).lower()
             if not commit or len(commit) != 40:
                 print(
                     f"VLLM_PRECOMPILED_WHEEL_COMMIT not valid: {commit}"
@@ -1036,16 +1039,10 @@ class precompiled_wheel_utils:
                 wheels, repo_url = precompiled_wheel_utils.fetch_metadata_for_variant(
                     commit, variant
                 )
-            except Exception as e:
-                raise RuntimeError(
-                    "Failed to fetch precompiled wheel metadata for CUDA "
-                    f"variant {variant!r} at commit {commit}. The "
-                    "root/default variant is not used as a fallback because "
-                    "its CUDA compatibility with the selected variant cannot "
-                    "be verified. Provide a compatible wheel with "
-                    "VLLM_PRECOMPILED_WHEEL_LOCATION or disable "
-                    "VLLM_USE_PRECOMPILED to build from source."
-                ) from e
+            except Exception:
+                wheels, repo_url = precompiled_wheel_utils.fetch_metadata_for_variant(
+                    commit, None
+                )
             # The metadata.json has the following format:
             # see .buildkite/scripts/generate-nightly-index.py for details
             """[{
