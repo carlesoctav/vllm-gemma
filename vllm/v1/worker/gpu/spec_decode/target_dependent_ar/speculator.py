@@ -85,6 +85,8 @@ class TargetDependentARSpeculator(AutoRegressiveSpeculator):
         skip_attn: bool,
         batch_desc: Any,
     ) -> None:
+        if not self.advance_draft_positions:
+            return
         _prepare_decode_inputs_kernel[(num_reqs + 1,)](
             self.draft_tokens[:num_reqs, 0],
             self.draft_tokens.stride(0),
@@ -118,13 +120,14 @@ class TargetDependentARSpeculator(AutoRegressiveSpeculator):
             logger.info("Capturing model for speculator...")
             self.last_token_indices.zero_()
             self.idx_mapping.zero_()
+            self.current_draft_step.zero_()
 
             self.on_multi_step_decode_begin(self.max_num_reqs)
             assert self.decode_cudagraph_manager is not None
             decode_fn = (
-                self._generate_fused_drafts
+                self._fused_multi_step_decode
                 if self.supports_decode_metadata_update
-                else self._generate_draft
+                else self._decode
             )
             self.decode_cudagraph_manager.capture(
                 decode_fn,
